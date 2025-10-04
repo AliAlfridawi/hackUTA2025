@@ -15,8 +15,8 @@ import requests
 import google.generativeai as genai
 
 # Get API keys from environment variables
-ELEVEN_LABS_API_KEY =k_b825ad16a92c0ef7693965b5b60a69ddd1f8b33ac1642b6
-GEMINI_API_KEY =AIzaSyA7Ybc1RmRl3VzngiRfRwqEgfC5E6WBAJw
+ELEVEN_LABS_API_KEY ="k_b825ad16a92c0ef7693965b5b60a69ddd1f8b33ac1642b6"
+GEMINI_API_KEY ="AIzaSyA7Ybc1RmRl3VzngiRfRwqEgfC5E6WBAJw"
 
 # Configure Gemini
 if GEMINI_API_KEY:
