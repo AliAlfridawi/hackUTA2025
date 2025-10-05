@@ -1,0 +1,14 @@
+faster-whisper
+soundfile
+speechrecognition
+pyaudio
+pynput
+pygame
+requests
+google-generativeai
+deepl
+openai
+elevenlabs
+googletrans==4.0.0-rc1
+httpx<0.27
+httpcore<1.0.3
