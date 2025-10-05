@@ -1,8 +1,10 @@
 # pi_translator_gpio.py
-import os, sys, time, threading
+import os
+import sys
+import time
+import threading
 import numpy as np
 import sounddevice as sd
-from scipy.io import wavfile
 import soundfile as sf
 from elevenlabs import ElevenLabs
 from dotenv import load_dotenv
@@ -11,80 +13,96 @@ from deep_translator import GoogleTranslator
 from gpiozero import Button, LED
 
 # -------------------- GPIO PINS (BCM) --------------------
-BTN_PTT_GPIO    = 17   # Push-to-talk button (hold-to-talk)
-LED_RED_GPIO    = 23   # RED: on while recording (button held)
-LED_GREEN_GPIO  = 24   # GREEN: on after release, stays on until next press
-BTN_BACK_GPIO   = None # Optional: a second button (e.g., 22) to trigger back-translation
+BTN_PTT_GPIO = 17      # Push-to-talk button (hold-to-talk)
+LED_RED_GPIO = 23      # RED: on while recording (button held)
+LED_GREEN_GPIO = 24    # GREEN: on after release, stays on until next press
+BTN_BACK_GPIO = None   # Optional: a second button (e.g., 22) for back-translation
 
-# -------------------- AUDIO / MODEL SETTINGS --------------------
-# 16 kHz keeps CPU load low on a Pi 3B and matches ElevenLabs "pcm_16000"
+# -------------------- AUDIO SETTINGS --------------------
 SAMPLE_RATE = 16000
-CHANNELS    = 1
-DTYPE       = np.float32
+CHANNELS = 1
+DTYPE = np.float32
 
 # -------------------- LOAD KEYS / INIT CLIENTS --------------------
 load_dotenv()
-elevenlabs = ElevenLabs(api_key=os.getenv("ELEVEN_API"))
-VOICE_ID   = os.getenv("VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-tts_model_id = "eleven_multilingual_v2"
 
+try:
+    elevenlabs = ElevenLabs(api_key=os.getenv("ELEVEN_API"))
+    VOICE_ID = os.getenv("VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+except Exception as e:
+    print(f"❌ Error initializing ElevenLabs: {e}")
+    print("Make sure your .env file has ELEVEN_API set correctly.")
+    sys.exit(1)
+
+tts_model_id = "eleven_multilingual_v2"
 translator = GoogleTranslator(source='auto', target='en')
 
 # -------------------- STATE --------------------
 recording = False
-audio_data = []             # list of numpy chunks captured by callback
-
+audio_data = []
 processing_audio = False
 ready_for_back = False
 
-last_source_text = None     # original (non-English) text
-last_source_lang = None     # ISO-639-1 (e.g., 'es')
-last_english_text = None    # English translation
+last_source_text = None
+last_source_lang = None
+last_english_text = None
 
 state_lock = threading.Lock()
-stop_program = False        # set True to exit the audio thread
+stop_program = False
 
 # -------------------- LEDs --------------------
-led_red   = LED(LED_RED_GPIO)
+led_red = LED(LED_RED_GPIO)
 led_green = LED(LED_GREEN_GPIO)
-led_red.off(); led_green.off()
+led_red.off()
+led_green.off()
 
 # -------------------- HELPERS --------------------
 def process_with_progress(description, total=100):
+    """Create a progress bar for visual feedback."""
     return tqdm(total=total, desc=description, leave=True,
                 bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}')
 
 def map_sdk_lang_to_iso(sdk_code: str) -> str:
+    """Convert language codes to ISO 639-1 format."""
     if not sdk_code:
         return None
     sdk_code = sdk_code.lower()
     mapping = {
-        'spa': 'es','eng': 'en','fra': 'fr','deu': 'de',
-        'ita': 'it','por': 'pt','rus': 'ru',
+        'spa': 'es', 'eng': 'en', 'fra': 'fr', 'deu': 'de',
+        'ita': 'it', 'por': 'pt', 'rus': 'ru', 'jpn': 'ja',
+        'kor': 'ko', 'zho': 'zh', 'ara': 'ar', 'hin': 'hi'
     }
     return mapping.get(sdk_code, sdk_code[:2])
 
 def extract_text_from_transcription(transcription):
+    """Extract text from various transcription response formats."""
     if transcription is None:
         return None
     if isinstance(transcription, str):
         return transcription
-    try:
-        from collections.abc import Mapping
-        if isinstance(transcription, Mapping):
-            return transcription.get("text") or transcription.get("transcript")
-    except Exception:
-        pass
+    
+    # Try dictionary access
+    if isinstance(transcription, dict):
+        return transcription.get("text") or transcription.get("transcript")
+    
+    # Try attribute access
     if hasattr(transcription, 'text'):
         return getattr(transcription, 'text')
+    
+    # Try nested transcripts
     if hasattr(transcription, 'transcripts'):
         try:
-            t = getattr(transcription, 'transcripts')
-            if isinstance(t, (list, tuple)) and len(t) > 0:
-                item = t[0]
-                return getattr(item, 'text', None) or (item.get('text') if isinstance(item, dict) else None)
+            transcripts = getattr(transcription, 'transcripts')
+            if isinstance(transcripts, (list, tuple)) and len(transcripts) > 0:
+                item = transcripts[0]
+                if hasattr(item, 'text'):
+                    return getattr(item, 'text')
+                if isinstance(item, dict):
+                    return item.get('text')
         except Exception:
             pass
+    
+    # Last resort: convert to string
     try:
         return str(transcription)
     except Exception:
@@ -92,261 +110,329 @@ def extract_text_from_transcription(transcription):
 
 # -------------------- AUDIO LOOP --------------------
 def audio_callback(indata, frames, time_info, status):
+    """Callback function for audio stream - captures audio when recording."""
     global audio_data
     if status:
-        print("Audio status:", status)
+        print(f"Audio status: {status}", file=sys.stderr)
     if recording:
+        # Convert to mono if stereo
         buf = np.mean(indata, axis=1) if indata.ndim > 1 else indata
         audio_data.append(buf.copy())
 
 def audio_thread_loop():
-    """Keep the InputStream open; append chunks when 'recording' is True."""
+    """Keep the audio input stream open continuously."""
     global stop_program
-    with sd.InputStream(samplerate=SAMPLE_RATE,
-                        channels=CHANNELS,
-                        dtype=DTYPE,
-                        blocksize=int(SAMPLE_RATE * 0.1),  # ~100ms
-                        callback=audio_callback):
-        print("Audio stream ready. Hold the button to talk.")
-        while not stop_program:
-            time.sleep(0.05)
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE,
+                            channels=CHANNELS,
+                            dtype=DTYPE,
+                            blocksize=int(SAMPLE_RATE * 0.1),  # 100ms blocks
+                            callback=audio_callback):
+            print("✅ Audio stream ready. Hold the button to talk.")
+            while not stop_program:
+                time.sleep(0.05)
+    except Exception as e:
+        print(f"❌ Audio stream error: {e}")
+        print("Check that your USB microphone is connected and working.")
 
-# -------------------- PROCESSING --------------------
+# -------------------- AUDIO PROCESSING --------------------
 def save_and_process_audio():
-    """STT (autodetect) -> translate to English -> TTS -> play.
-       Also sets up state for back-translation."""
+    """Process recorded audio: STT → Translate → TTS → Play."""
     global processing_audio, ready_for_back, last_english_text, last_source_text, last_source_lang
 
     with state_lock:
-        if not audio_data:
+        if not audio_data or len(audio_data) == 0:
+            print("⚠️  No audio data recorded.")
             return
         processing_audio = True
         ready_for_back = False
 
-    print("\nProcessing your audio...")
-    progress = process_with_progress("Preparing audio", 100)
-
-    # Combine, normalize, save WAV
+    print("\n📝 Processing your audio...")
     temp_wav = "temp_recording.wav"
+    
     try:
+        # Step 1: Combine and normalize audio
+        progress = process_with_progress("Preparing audio", 100)
         combined = np.concatenate(audio_data).astype(np.float32)
+        
         if combined.size == 0:
             raise ValueError("Recorded audio is empty")
-        m = float(np.max(np.abs(combined)))
-        if m > 0:
-            combined /= m
-        pcm = np.int16(np.clip(combined, -1.0, 1.0) * 32767)
-        wavfile.write(temp_wav, SAMPLE_RATE, pcm)
+        
+        # Normalize to prevent clipping
+        max_val = float(np.max(np.abs(combined)))
+        if max_val > 0:
+            combined = combined / max_val
+        
+        # Save as WAV file using soundfile (more reliable)
+        sf.write(temp_wav, combined, SAMPLE_RATE, subtype='PCM_16')
+        
         for _ in range(100):
-            progress.update(1); time.sleep(0.003)
-    except Exception as e:
+            progress.update(1)
+            time.sleep(0.003)
         progress.close()
-        print(f"Error saving WAV: {e}")
-        with state_lock:
-            processing_audio = False
-        return
-    progress.close()
 
-    try:
-        # --- STT ---
+        # Step 2: Speech-to-Text
         progress = process_with_progress("Converting speech to text", 100)
         with open(temp_wav, 'rb') as f:
+            # Updated API call format
             transcription = elevenlabs.speech_to_text.convert(
-                file=f, model_id="scribe_v1", file_format="other"
+                audio=f,
+                model_id="scribe_v1"
             )
-        progress.update(100); progress.close()
+        progress.update(100)
+        progress.close()
 
         detected_text = extract_text_from_transcription(transcription)
         if not detected_text or not str(detected_text).strip():
-            print("❌ No speech detected.")
+            print("❌ No speech detected. Try speaking louder or closer to the mic.")
             with state_lock:
                 processing_audio = False
             return
 
         source_text = str(detected_text).strip()
-        sdk_lang   = getattr(transcription, 'language_code', None)
-        detected_iso = map_sdk_lang_to_iso(sdk_lang)
-        print(f"\n🗣️  Source ({detected_iso}): {source_text}")
+        sdk_lang = getattr(transcription, 'language_code', None)
+        detected_iso = map_sdk_lang_to_iso(sdk_lang) if sdk_lang else 'unknown'
+        print(f"\n🗣️  Detected ({detected_iso}): {source_text}")
 
-        # --- Translate -> English ---
+        # Step 3: Translate to English
         progress = process_with_progress("Translating to English", 100)
         try:
             english_text = translator.translate(source_text)
         except Exception as e:
-            print(f"Translation error, using source text: {e}")
-            english_text = source_text
-        progress.update(100); progress.close()
-        print(f"\n🔤 English: {english_text}")
+            print(f"⚠️  Translation error: {e}")
+            english_text = source_text  # Fallback to original
+        progress.update(100)
+        progress.close()
+        print(f"🔤 English: {english_text}")
 
-        # Snapshot for back-translation; allow parallel TTS
+        # Update state for potential back-translation
         with state_lock:
             last_english_text = english_text
-            last_source_text  = source_text
-            last_source_lang  = detected_iso
-            ready_for_back    = bool(last_english_text and last_source_lang)
-            processing_audio  = False
+            last_source_text = source_text
+            last_source_lang = detected_iso
+            ready_for_back = bool(last_english_text and last_source_lang)
+            processing_audio = False
 
-        # --- TTS -> play ---
-        print("\n🎯 Generating English speech…")
-        progress = process_with_progress("Generating English speech", 100)
+        # Step 4: Text-to-Speech (English)
+        print("🎯 Generating English speech...")
+        progress = process_with_progress("Generating speech", 100)
+        
         audio_chunks = []
         for chunk in elevenlabs.text_to_speech.convert(
-            VOICE_ID,
+            voice_id=VOICE_ID,
             text=english_text,
             output_format="pcm_16000",
-            model_id=tts_model_id,
+            model_id=tts_model_id
         ):
             audio_chunks.append(chunk)
-        progress.update(100); progress.close()
+        
+        progress.update(100)
+        progress.close()
 
         if not audio_chunks:
-            print("❌ No audio data from TTS"); return
+            print("❌ No audio generated from TTS")
+            return
 
-        # Assemble and play
-        with open('temp_response.raw', 'wb') as f:
+        # Step 5: Save and play audio
+        temp_response = 'temp_response.raw'
+        with open(temp_response, 'wb') as f:
             f.write(b"".join(audio_chunks))
-        data, sr = sf.read('temp_response.raw', samplerate=16000,
+        
+        # Convert RAW to WAV for easier playback
+        data, sr = sf.read(temp_response, samplerate=16000,
                            channels=1, format='RAW', subtype='PCM_16')
-        sf.write('temp_response.wav', data, sr)
+        temp_wav_output = 'temp_response.wav'
+        sf.write(temp_wav_output, data, sr)
 
-        print("\n🔊 Playing translation…")
-        # NOTE: Per your new behavior, GREEN stays ON already; we do not blink LEDs here.
-        data, sr = sf.read('temp_response.wav')
-        sd.play(data, sr); sd.wait()
+        print("🔊 Playing translation...")
+        # Play the audio (GREEN LED is already on from button release)
+        data, sr = sf.read(temp_wav_output)
+        sd.play(data, sr)
+        sd.wait()
         print("✅ Playback complete\n")
 
     except Exception as e:
-        print(f"Error processing audio: {e}")
+        print(f"❌ Error processing audio: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        for path in ("temp_recording.wav","temp_response.raw","temp_response.wav"):
+        # Clean up temp files
+        for path in (temp_wav, "temp_response.raw", "temp_response.wav"):
             try:
-                if os.path.exists(path): os.remove(path)
+                if os.path.exists(path):
+                    os.remove(path)
             except Exception:
                 pass
+        
         with state_lock:
             processing_audio = False
 
-        if ready_for_back:
-            print("Ready for back-translation (if you wire a second button or call translate_back()).")
-
-# -------------------- BACK TRANSLATION (optional) --------------------
+# -------------------- BACK TRANSLATION --------------------
 BACK_RECORD_SECONDS = 5
 
 def translate_back():
-    """Record short English reply, translate back to detected language, TTS & play."""
+    """Record English reply and translate back to detected language."""
     with state_lock:
         if processing_audio:
-            print("Busy processing—try again in a moment."); return
+            print("⚠️  System is busy processing. Try again in a moment.")
+            return
         target_lang = last_source_lang
-    if not target_lang:
-        print("No source language yet—speak first."); return
+    
+    if not target_lang or target_lang == 'unknown':
+        print("⚠️  No source language detected yet. Speak first in a foreign language.")
+        return
 
-    print(f"Recording English reply for {BACK_RECORD_SECONDS}s…")
-    rec = sd.rec(int(BACK_RECORD_SECONDS * SAMPLE_RATE),
-                 samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
-    sd.wait()
-    rec = np.mean(rec, axis=1) if rec.ndim > 1 else rec
-    m = float(np.max(np.abs(rec))) if rec.size else 0.0
-    if m > 0: rec = rec / m
-    pcm = np.int16(np.clip(rec, -1.0, 1.0) * 32767)
-    wavfile.write('temp_reply.wav', SAMPLE_RATE, pcm)
+    print(f"\n🎤 Recording English reply for {BACK_RECORD_SECONDS} seconds...")
+    
+    try:
+        # Record English response
+        rec = sd.rec(int(BACK_RECORD_SECONDS * SAMPLE_RATE),
+                     samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+        sd.wait()
+        
+        # Normalize
+        rec = np.mean(rec, axis=1) if rec.ndim > 1 else rec
+        max_val = float(np.max(np.abs(rec))) if rec.size else 0.0
+        if max_val > 0:
+            rec = rec / max_val
+        
+        temp_reply = 'temp_reply.wav'
+        sf.write(temp_reply, rec, SAMPLE_RATE, subtype='PCM_16')
 
-    print("Converting reply to text…")
-    with open('temp_reply.wav', 'rb') as f:
-        transcription = elevenlabs.speech_to_text.convert(
-            file=f, model_id="scribe_v1", language_code="eng", file_format="other"
-        )
-    reply_text = extract_text_from_transcription(transcription)
-    if not reply_text or not reply_text.strip():
-        print("No English speech detected in reply."); return
-    reply_text = reply_text.strip()
-    print(f"🗣️  Reply: {reply_text}")
+        # Transcribe English reply
+        print("📝 Converting reply to text...")
+        with open(temp_reply, 'rb') as f:
+            transcription = elevenlabs.speech_to_text.convert(
+                audio=f,
+                model_id="scribe_v1"
+            )
+        
+        reply_text = extract_text_from_transcription(transcription)
+        if not reply_text or not reply_text.strip():
+            print("❌ No speech detected in reply.")
+            return
+        
+        reply_text = reply_text.strip()
+        print(f"🗣️  Your reply: {reply_text}")
 
-    print(f"Translating back to {target_lang}…")
-    back_text = GoogleTranslator(source='auto', target=target_lang).translate(reply_text)
-    print(f"🔤 Back: {back_text}")
+        # Translate back to source language
+        print(f"🔄 Translating back to {target_lang}...")
+        back_text = GoogleTranslator(source='auto', target=target_lang).translate(reply_text)
+        print(f"🔤 Translation: {back_text}")
 
-    print("Generating back-translation speech…")
-    audio_chunks = []
-    for chunk in elevenlabs.text_to_speech.convert(
-        VOICE_ID, text=back_text, output_format="pcm_16000",
-        model_id=tts_model_id, language_code=target_lang
-    ):
-        audio_chunks.append(chunk)
-    if not audio_chunks:
-        print("No audio from TTS."); return
+        # Generate speech in source language
+        print("🎯 Generating speech...")
+        audio_chunks = []
+        for chunk in elevenlabs.text_to_speech.convert(
+            voice_id=VOICE_ID,
+            text=back_text,
+            output_format="pcm_16000",
+            model_id=tts_model_id
+        ):
+            audio_chunks.append(chunk)
+        
+        if not audio_chunks:
+            print("❌ No audio generated from TTS")
+            return
 
-    with open('temp_back.raw','wb') as f: f.write(b"".join(audio_chunks))
-    data, sr = sf.read('temp_back.raw', samplerate=16000,
-                       channels=1, format='RAW', subtype='PCM_16')
-    sf.write('temp_back.wav', data, sr)
+        # Save and play
+        temp_back_raw = 'temp_back.raw'
+        with open(temp_back_raw, 'wb') as f:
+            f.write(b"".join(audio_chunks))
+        
+        data, sr = sf.read(temp_back_raw, samplerate=16000,
+                           channels=1, format='RAW', subtype='PCM_16')
+        temp_back_wav = 'temp_back.wav'
+        sf.write(temp_back_wav, data, sr)
 
-    print("🔊 Playing back-translation…")
-    # GREEN stays on; no LED blinking here either.
-    data, sr = sf.read('temp_back.wav')
-    sd.play(data, sr); sd.wait()
-    for p in ('temp_reply.wav','temp_back.raw','temp_back.wav'):
-        try:
-            if os.path.exists(p): os.remove(p)
-        except Exception:
-            pass
-    print("✅ Back-translation playback complete\n")
+        print("🔊 Playing back-translation...")
+        data, sr = sf.read(temp_back_wav)
+        sd.play(data, sr)
+        sd.wait()
+        
+        print("✅ Back-translation complete\n")
+
+    except Exception as e:
+        print(f"❌ Error in back-translation: {e}")
+    finally:
+        # Cleanup
+        for path in ('temp_reply.wav', 'temp_back.raw', 'temp_back.wav'):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
 # -------------------- BUTTON EVENTS --------------------
 def on_ptt_press():
-    """Start recording while the PTT button is held."""
+    """Handle push-to-talk button press."""
     global recording, audio_data
     audio_data = []
     recording = True
-    # LED behavior per spec:
-    led_green.off()  # entering recording => green OFF
-    led_red.on()     # red ON while held
-    print("\n🎤 Recording… (release to stop)")
+    led_green.off()  # Turn off green when starting new recording
+    led_red.on()     # Turn on red while recording
+    print("\n🎤 Recording... (release to stop)")
 
 def on_ptt_release():
-    """Stop recording and kick off processing in a thread."""
+    """Handle push-to-talk button release."""
     global recording
     recording = False
-    # LED behavior per spec:
-    led_red.off()    # leaving recording => red OFF
-    led_green.on()   # green ON and stays ON until next press
-    print("\n✋ Recording stopped; processing…")
+    led_red.off()    # Turn off red when done recording
+    led_green.on()   # Turn on green during processing/playback
+    print("✋ Recording stopped. Processing...")
     threading.Thread(target=save_and_process_audio, daemon=True).start()
 
 def on_back_press():
-    """Optional: second button to trigger back-translation."""
+    """Handle back-translation button press."""
     threading.Thread(target=translate_back, daemon=True).start()
 
 # -------------------- MAIN --------------------
 def main():
-    # Button wiring: button between GPIO and GND; we use internal pull-ups (active-low)
-    btn = Button(BTN_PTT_GPIO, pull_up=True, bounce_time=0.05)
-    btn.when_pressed  = on_ptt_press
-    btn.when_released = on_ptt_release
-
-    if BTN_BACK_GPIO is not None:
-        btn2 = Button(BTN_BACK_GPIO, pull_up=True, bounce_time=0.1)
-        btn2.when_pressed = on_back_press
-
-    # Start audio input thread
-    t = threading.Thread(target=audio_thread_loop, daemon=True)
-    t.start()
-
-    print("\n🎤 Voice Translator (Pi + GPIO)")
-    print("Hold the button to record (RED on). Release to process and speak (GREEN on).")
-    if BTN_BACK_GPIO is not None:
-        print("Tap the back-button to translate English reply back to the detected language.")
-    print("Press Ctrl+C to exit.\n")
-
+    """Main program entry point."""
+    print("\n" + "="*50)
+    print("🎤 Voice Translator (Raspberry Pi + GPIO)")
+    print("="*50)
+    
     try:
+        # Initialize push-to-talk button
+        btn = Button(BTN_PTT_GPIO, pull_up=True, bounce_time=0.05)
+        btn.when_pressed = on_ptt_press
+        btn.when_released = on_ptt_release
+
+        # Initialize back-translation button (if configured)
+        if BTN_BACK_GPIO is not None:
+            btn2 = Button(BTN_BACK_GPIO, pull_up=True, bounce_time=0.1)
+            btn2.when_pressed = on_back_press
+            print(f"Back-translation button enabled on GPIO {BTN_BACK_GPIO}")
+
+        # Start audio input thread
+        audio_thread = threading.Thread(target=audio_thread_loop, daemon=True)
+        audio_thread.start()
+
+        print("\n📋 Instructions:")
+        print("  • Hold the button to record (RED LED on)")
+        print("  • Release to process and hear translation (GREEN LED on)")
+        if BTN_BACK_GPIO is not None:
+            print("  • Press back button to translate English reply")
+        print("\nPress Ctrl+C to exit\n")
+
+        # Main loop
         while True:
             time.sleep(0.25)
+
     except KeyboardInterrupt:
-        print("\nExiting…")
+        print("\n\n👋 Shutting down...")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
+        # Cleanup
         global stop_program
         stop_program = True
-        led_red.off(); led_green.off()
+        led_red.off()
+        led_green.off()
+        print("✅ Cleanup complete. Goodbye!\n")
 
 if __name__ == "__main__":
     main()
