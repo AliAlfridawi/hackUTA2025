@@ -1,0 +1,23 @@
+# Exact pinned project dependencies (matched to the virtualenv used during development)
+# Install into a fresh virtual environment (Python 3.11 recommended)
+
+elevenlabs==2.16.0
+sounddevice==0.5.2
+soundfile==0.13.1
+numpy==2.3.3
+scipy==1.16.2
+keyboard==0.13.5
+tqdm==4.67.1
+deep-translator==1.11.4
+python-dotenv==1.1.1
+
+# Optional / common transitive dependencies found in the environment (included for stability)
+httpx==0.28.1
+httpcore==1.0.9
+requests==2.32.5
+certifi==2025.8.3
+urllib3==2.5.0
+websockets==15.0.1
+
+# Optional (if you need better audio handling or VAD in the future):
+# webrtcvad
